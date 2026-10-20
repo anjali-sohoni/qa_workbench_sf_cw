@@ -1,0 +1,443 @@
+name: Run Playwright Tests
+
+# Triggered by the QA Workbench Lambda after pushing a spec file.
+# Always runs on the default branch (where the workflow file lives).
+# Fetches the exact spec commit via commit_sha input so test files are
+# always found regardless of branch state.
+on:
+  workflow_dispatch:
+    inputs:
+      story_id:
+        description: 'Story ID (e.g. US-0001) — used to label the report'
+        required: false
+        default: ''
+      actor:
+        description: 'Who triggered the run'
+        required: false
+        default: 'ci'
+      commit_sha:
+        description: 'Exact commit SHA containing the spec files (pushed by QA Workbench)'
+        required: false
+        default: ''
+      spec_paths:
+        description: 'Comma-separated spec file paths to run (e.g. tests/cross-app/TC-0001-02.spec.ts)'
+        required: false
+        default: ''
+      project:
+        description: 'Project code (e.g. SF-v1) — used to filter runs in the dashboard'
+        required: false
+        default: ''
+
+permissions:
+  id-token: write   # required for AWS OIDC (configure-aws-credentials)
+  contents: read    # required for actions/checkout
+
+env:
+  # Audit requirement: OS-level screen recording (browser + native taskbar clock),
+  # not just Playwright's own per-test screenshot/video. This is the workflow
+  # github_push actually dispatches (GITHUB_PW_WORKFLOW, default run-playwright.yml)
+  # -- github-templates/workflows/qa-workbench.yml is NOT wired to run automatically
+  # anywhere in this pipeline, so the recording feature belongs here.
+  # See HEADED_MODE_AUDIT_RECORDING_ARCHITECTURE.md.
+  RECORDING_TZ: "Asia/Kolkata"   # not yet confirmed with the audit team -- change freely
+
+jobs:
+  playwright:
+    name: Playwright Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout default branch (config + workflow lives here)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history to fetch arbitrary commits
+
+      - name: Fetch spec files from the pushed commit
+        run: |
+          SHA="${{ github.event.inputs.commit_sha }}"
+          PATHS="${{ github.event.inputs.spec_paths }}"
+
+          if [ -z "$SHA" ]; then
+            echo "No commit_sha provided — using files already on this branch."
+          else
+            echo "Fetching spec commit $SHA..."
+            git fetch origin "$SHA" 2>/dev/null || git fetch --all
+            if [ -n "$PATHS" ]; then
+              # Checkout only the specific spec files from the commit
+              echo "$PATHS" | tr ',' '\n' | while read -r p; do
+                p=$(echo "$p" | xargs)  # trim whitespace
+                if [ -n "$p" ]; then
+                  mkdir -p "$(dirname "$p")"
+                  git checkout "$SHA" -- "$p" 2>/dev/null && echo "  fetched: $p" || echo "  ⚠ could not fetch: $p"
+                fi
+              done
+            else
+              # No specific paths — checkout the whole tests/ directory from the commit
+              git checkout "$SHA" -- tests/ 2>/dev/null && echo "  fetched tests/ from $SHA" || echo "  ⚠ could not fetch tests/ from $SHA"
+            fi
+          fi
+
+          echo ""
+          echo "=== Spec files present ==="
+          find . -name "*.spec.ts" -not -path "*/node_modules/*" | sort || echo "(none found)"
+
+      - name: Debug -- print the playwright.config.ts actually live in this checkout
+        run: |
+          echo "=== playwright.config.ts as checked out for this run ==="
+          cat playwright.config.ts || echo "(no playwright.config.ts found at repo root!)"
+          echo "=== CI env var (drives headless in the old config; unconditional false in the new one) ==="
+          echo "CI=$CI"
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Playwright browsers (Chromium only)
+        run: npx playwright install --with-deps chromium
+
+      # ── Audit recording: real desktop (Xvfb + openbox + tint2), native local time ──
+      # playwright.config.ts now sets headless:false unconditionally, so this display
+      # is required for Chromium to launch here at all, not just for the recording.
+      - name: Install desktop + recording dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y xvfb openbox tint2 ffmpeg wmctrl x11-apps imagemagick \
+            x11-xserver-utils fonts-ubuntu
+
+      - name: Start virtual desktop (Xvfb + openbox + tint2, native local time, Ubuntu-style UI)
+        run: |
+          sudo timedatectl set-timezone "${RECORDING_TZ}" || sudo ln -snf "/usr/share/zoneinfo/${RECORDING_TZ}" /etc/localtime
+          echo "TZ=${RECORDING_TZ}" >> "$GITHUB_ENV"
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
+          Xvfb :99 -screen 0 1280x900x24 -ac +extension RANDR &
+          echo $! > /tmp/xvfb.pid
+          sleep 2
+
+          # Ubuntu-style desktop background (classic Ubuntu aubergine) instead of a bare
+          # black void behind/around the browser window -- this alone is what most viewers
+          # will visually associate with "Ubuntu" at a glance.
+          DISPLAY=:99 xsetroot -solid '#2C001E' || true
+
+          DISPLAY=:99 openbox &
+          echo $! > /tmp/openbox.pid
+          sleep 1
+
+          mkdir -p "$HOME/.config/tint2"
+          TINT2RC="$HOME/.config/tint2/tint2rc"
+          : > "$TINT2RC"
+
+          # Panel: taskbar (shows the open Chromium window like a real OS taskbar entry,
+          # not just a floating clock) + systray + clock, styled after Ubuntu's GNOME top
+          # bar (near-black bar, Ubuntu-orange highlight on the active window).
+          echo 'panel_items = TSC'                                   >> "$TINT2RC"
+          echo 'panel_size = 100% 30'                                 >> "$TINT2RC"
+          echo 'panel_margin = 0 0'                                   >> "$TINT2RC"
+          echo 'panel_padding = 6 2 6'                                 >> "$TINT2RC"
+          echo 'panel_background_id = 1'                              >> "$TINT2RC"
+          echo 'panel_position = top center horizontal'               >> "$TINT2RC"
+          echo 'panel_layer = top'                                    >> "$TINT2RC"
+          echo 'panel_monitor = all'                                   >> "$TINT2RC"
+          echo 'autohide = 0'                                         >> "$TINT2RC"
+          echo 'strut_policy = follow_size'                           >> "$TINT2RC"
+          echo 'panel_dock = 0'                                       >> "$TINT2RC"
+          echo 'startup_notifications = 0'                            >> "$TINT2RC"
+
+          # background_id 1 -- the panel itself (GNOME-style near-black top bar)
+          echo 'rounded = 0'                                          >> "$TINT2RC"
+          echo 'border_width = 0'                                     >> "$TINT2RC"
+          echo 'background_color = #1b1b1b 100'                       >> "$TINT2RC"
+          echo 'border_color = #000000 0'                              >> "$TINT2RC"
+
+          # background_id 2 -- active-window highlight (Ubuntu/Yaru orange accent)
+          echo 'rounded = 3'                                          >> "$TINT2RC"
+          echo 'border_width = 0'                                     >> "$TINT2RC"
+          echo 'background_color = #E95420 100'                       >> "$TINT2RC"
+          echo 'border_color = #000000 0'                              >> "$TINT2RC"
+
+          # Taskbar -- one entry per open window, so the Chromium window actually shows up
+          # in the bar like a real desktop session, instead of the bar being just a clock.
+          echo 'taskbar_mode = single_desktop'                         >> "$TINT2RC"
+          echo 'taskbar_padding = 4 2 4'                               >> "$TINT2RC"
+          echo 'taskbar_background_id = 1'                             >> "$TINT2RC"
+          echo 'taskbar_active_background_id = 1'                      >> "$TINT2RC"
+          echo 'task_text = 1'                                        >> "$TINT2RC"
+          echo 'task_icon = 1'                                        >> "$TINT2RC"
+          echo 'task_centered = 0'                                     >> "$TINT2RC"
+          echo 'task_maximum_size = 220 30'                            >> "$TINT2RC"
+          echo 'task_padding = 6 2'                                    >> "$TINT2RC"
+          echo 'task_font = Ubuntu 9'                                  >> "$TINT2RC"
+          echo 'task_font_color = #f2f2f2 100'                         >> "$TINT2RC"
+          echo 'task_background_id = 0'                                >> "$TINT2RC"
+          echo 'task_active_background_id = 2'                         >> "$TINT2RC"
+          echo 'task_active_font_color = #ffffff 100'                  >> "$TINT2RC"
+
+          # System tray -- another normal top-bar element real desktops have.
+          echo 'systray_padding = 4 2 4'                               >> "$TINT2RC"
+          echo 'systray_background_id = 0'                             >> "$TINT2RC"
+          echo 'systray_sort = ascending'                              >> "$TINT2RC"
+
+          # Clock -- still the audit-relevant native date/time, just styled like the text
+          # in Ubuntu's actual GNOME top bar rather than a generic floating readout.
+          echo 'time1_format = %a %d %b %Y  %H:%M:%S'                  >> "$TINT2RC"
+          echo 'time1_font = Ubuntu 10'                                 >> "$TINT2RC"
+          echo 'clock_font_color = #f2f2f2 100'                         >> "$TINT2RC"
+          echo 'clock_padding = 8 0'                                    >> "$TINT2RC"
+          echo 'clock_background_id = 0'                                >> "$TINT2RC"
+          echo 'clock_tooltip = %Y-%m-%d %H:%M:%S %Z'                   >> "$TINT2RC"
+
+          DISPLAY=:99 TZ="${RECORDING_TZ}" tint2 &
+          echo $! > /tmp/tint2.pid
+          sleep 1
+
+      - name: Start OS screen recording
+        run: |
+          mkdir -p recordings recordings/debug
+          DISPLAY=:99 TZ="${RECORDING_TZ}" ffmpeg -y \
+            -video_size 1280x900 -framerate 15 -f x11grab -i :99 \
+            -pix_fmt yuv420p -movflags +faststart \
+            recordings/session-recording.mp4 > recordings/debug/ffmpeg.log 2>&1 &
+          echo $! > /tmp/ffmpeg.pid
+          sleep 1
+
+          # Debug instrumentation (temporary, until the black-screen issue is confirmed
+          # fixed): every 15s, dump the X11 window list (does Chromium's window even
+          # exist? where is it?) and a still frame of the actual display, so a black
+          # recording can be diagnosed from evidence instead of guessing again.
+          ( i=0
+            while [ -f /tmp/ffmpeg.pid ]; do
+              i=$((i+1))
+              {
+                echo "=== $(date -Is) ==="
+                DISPLAY=:99 wmctrl -l -G 2>&1 || echo "(wmctrl failed)"
+                DISPLAY=:99 xwininfo -root -tree 2>&1 || echo "(xwininfo failed)"
+              } >> recordings/debug/windows.log
+              DISPLAY=:99 import -window root "recordings/debug/shot-$(printf '%03d' "$i").png" 2>/dev/null || true
+              sleep 15
+            done
+          ) &
+          echo $! > /tmp/diag.pid
+
+      - name: Validate required secrets
+        run: |
+          MISSING=""
+          [ -z "$SF_COMM_URL" ]           && MISSING="$MISSING SF_COMM_URL"
+          [ -z "$SF_COMM_USERNAME" ]      && MISSING="$MISSING SF_COMM_USERNAME"
+          [ -z "$SF_COMM_EFFECTIVE_PW" ]  && MISSING="$MISSING SF_COMM_EFFECTIVE_PW"
+          [ -z "$SF_SALES_URL" ]          && MISSING="$MISSING SF_SALES_URL"
+          [ -z "$SF_SALES_USERNAME" ]     && MISSING="$MISSING SF_SALES_USERNAME"
+          [ -z "$SF_SALES_EFFECTIVE_PW" ] && MISSING="$MISSING SF_SALES_EFFECTIVE_PW"
+          if [ -n "$MISSING" ]; then
+            echo "❌ Missing required GitHub secrets:$MISSING"
+            echo "Add them at: https://github.com/$GITHUB_REPOSITORY/settings/secrets/actions"
+            exit 1
+          fi
+          echo "✅ All required secrets present"
+          echo "   SF_COMM_URL  = $SF_COMM_URL"
+          echo "   SF_SALES_URL = $SF_SALES_URL"
+        env:
+          SF_COMM_URL:           ${{ secrets.SF_COMM_URL }}
+          SF_COMM_USERNAME:      ${{ secrets.SF_COMM_USERNAME }}
+          SF_COMM_EFFECTIVE_PW:  ${{ secrets.SF_COMM_EFFECTIVE_PW }}
+          SF_SALES_URL:          ${{ secrets.SF_SALES_URL }}
+          SF_SALES_USERNAME:     ${{ secrets.SF_SALES_USERNAME }}
+          SF_SALES_EFFECTIVE_PW: ${{ secrets.SF_SALES_EFFECTIVE_PW }}
+
+      - name: Run Playwright tests
+        id: run_tests
+        env:
+          SF_COMM_URL:           ${{ secrets.SF_COMM_URL }}
+          SF_COMM_USERNAME:      ${{ secrets.SF_COMM_USERNAME }}
+          SF_COMM_EFFECTIVE_PW:  ${{ secrets.SF_COMM_EFFECTIVE_PW }}
+          SF_SALES_URL:          ${{ secrets.SF_SALES_URL }}
+          SF_SALES_USERNAME:     ${{ secrets.SF_SALES_USERNAME }}
+          SF_SALES_EFFECTIVE_PW: ${{ secrets.SF_SALES_EFFECTIVE_PW }}
+          # Temporary while diagnosing the black-screen recording: wmctrl shows zero
+          # Chromium windows ever appearing on :99 despite headless:false being live,
+          # so we need Playwright's own browser-launch tracing (exact Chromium command
+          # line + Chromium's own stdout/stderr) to see what's actually happening,
+          # rather than guessing another launch flag. Remove once resolved.
+          DEBUG: "pw:browser"
+        # Reporters are defined in playwright.config.ts (list + json → test-results.json + html).
+        # Do NOT pass --reporter here — CLI --reporter overrides config and drops the outputFile,
+        # causing test-results.json to never be written (JSON goes to stdout instead).
+        run: npx playwright test
+        continue-on-error: true   # upload report even on test failure
+
+      - name: Stop OS screen recording
+        if: always()
+        run: |
+          FFMPEG_PID_FILE=/tmp/ffmpeg.pid
+          if [ -f "$FFMPEG_PID_FILE" ]; then
+            FFMPEG_PID="$(cat "$FFMPEG_PID_FILE")"
+            rm -f "$FFMPEG_PID_FILE"   # stops the debug diagnostic loop's `while` condition too
+            kill -INT "$FFMPEG_PID" 2>/dev/null || true
+            for i in $(seq 1 10); do
+              kill -0 "$FFMPEG_PID" 2>/dev/null || break
+              sleep 1
+            done
+          fi
+          [ -f /tmp/diag.pid ]    && kill "$(cat /tmp/diag.pid)"    2>/dev/null || true
+          [ -f /tmp/tint2.pid ]   && kill "$(cat /tmp/tint2.pid)"   2>/dev/null || true
+          [ -f /tmp/openbox.pid ] && kill "$(cat /tmp/openbox.pid)" 2>/dev/null || true
+          [ -f /tmp/xvfb.pid ]    && kill "$(cat /tmp/xvfb.pid)"    2>/dev/null || true
+          ls -la recordings/ recordings/debug/ 2>/dev/null || true
+
+      - name: Upload Playwright report to GitHub Actions
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-${{ github.event.inputs.story_id || github.run_id }}
+          path: |
+            playwright-report/
+            test-results/
+            recordings/
+          retention-days: 30
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        if: always()
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+        continue-on-error: true   # non-fatal if OIDC not configured
+
+      - name: Upload artifacts to S3
+        if: always()
+        env:
+          ARTIFACTS_BUCKET: ${{ secrets.ARTIFACTS_BUCKET }}
+        run: |
+          STORY="${{ github.event.inputs.story_id }}"
+          RUN_ID="${{ github.run_id }}"
+          S3_PREFIX="runs/${STORY}/${RUN_ID}"
+
+          if [ -z "$ARTIFACTS_BUCKET" ]; then
+            echo "ARTIFACTS_BUCKET secret not set — skipping S3 upload"
+            echo "S3_PREFIX=" >> "$GITHUB_ENV"
+          else
+            echo "Uploading artifacts to s3://${ARTIFACTS_BUCKET}/${S3_PREFIX}/"
+
+            if [ -d test-results ] && [ -n "$(ls -A test-results 2>/dev/null)" ]; then
+              aws s3 cp test-results/ "s3://${ARTIFACTS_BUCKET}/${S3_PREFIX}/test-results/" \
+                --recursive --quiet && echo "  ✅ test-results/ uploaded" \
+                || echo "  ⚠ test-results/ upload failed (non-fatal)"
+            fi
+
+            if [ -d playwright-report ] && [ -n "$(ls -A playwright-report 2>/dev/null)" ]; then
+              aws s3 cp playwright-report/ "s3://${ARTIFACTS_BUCKET}/${S3_PREFIX}/playwright-report/" \
+                --recursive --quiet && echo "  ✅ playwright-report/ uploaded" \
+                || echo "  ⚠ playwright-report/ upload failed (non-fatal)"
+            fi
+
+            # Audit requirement: the full-session OS screen recording (browser +
+            # native taskbar clock), uploaded as a run-level artifact alongside the
+            # per-test screenshots/videos above.
+            if [ -f recordings/session-recording.mp4 ]; then
+              RECORDING_KEY="${S3_PREFIX}/session-recording.mp4"
+              RECORDING_SHA256=$(sha256sum recordings/session-recording.mp4 | awk '{print $1}')
+              aws s3 cp recordings/session-recording.mp4 "s3://${ARTIFACTS_BUCKET}/${RECORDING_KEY}" --quiet \
+                && echo "  ✅ session-recording.mp4 uploaded (sha256 ${RECORDING_SHA256})" \
+                || echo "  ⚠ session-recording.mp4 upload failed (non-fatal)"
+              echo "RECORDING_KEY=${RECORDING_KEY}" >> "$GITHUB_ENV"
+              echo "RECORDING_SHA256=${RECORDING_SHA256}" >> "$GITHUB_ENV"
+            else
+              echo "  (no session recording found -- continuing without one)"
+            fi
+
+            echo "S3_PREFIX=${S3_PREFIX}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Post results back to QA Workbench API
+        if: always()
+        env:
+          QA_API_URL: ${{ secrets.QA_WORKBENCH_API }}
+        run: |
+          STATUS="${{ steps.run_tests.outcome }}"
+          STORY="${{ github.event.inputs.story_id }}"
+          PROJECT="${{ github.event.inputs.project }}"
+          ACTOR="${{ github.event.inputs.actor }}"
+          RUN_ID="${{ github.run_id }}"
+          REPO="${{ github.repository }}"
+          SHA="${{ github.event.inputs.commit_sha }}"
+          S3_PREFIX="${{ env.S3_PREFIX }}"
+          RECORDING_KEY="${{ env.RECORDING_KEY }}"
+          RECORDING_SHA256="${{ env.RECORDING_SHA256 }}"
+
+          # ── Per-test details from Playwright JSON reporter (test-results.json) ──
+          # Extract each spec's title, status, duration, and attachment paths.
+          # Attachments use `rel` (path relative to test-results/) so the Lambda
+          # can generate presigned S3 URLs as: {s3_prefix}/test-results/{rel}
+          TESTS_JSON="[]"
+          SUMMARY_JSON='{"passed":0,"failed":0,"skipped":0,"duration":0}'
+
+          if [ -f test-results.json ]; then
+            TESTS_JSON=$(jq -c '[
+              .suites[]? as $top |
+              ($top.specs[]?, ($top.suites[]?.specs[]?)) |
+              select(. != null and has("title") and has("tests")) |
+              {
+                title: .title,
+                file: ($top.file // $top.title // ""),
+                ok: (.ok // false),
+                status: (if (.ok // false) then "passed" else "failed" end),
+                duration: ((.tests // []) | first? | (.results // []) | last? | .duration // 0),
+                error:    ((.tests // []) | first? | (.results // []) | last? | .errors[0]?.message // null),
+                attachments: [
+                  ((.tests // []) | first? | (.results // []) | last? | .attachments // [])[] |
+                  select(.path != null and .path != "") |
+                  { name: .name, contentType: (.contentType // ""), rel: (.path | split("test-results/") | last) }
+                ]
+              }
+            ]' test-results.json 2>/dev/null || echo "[]")
+
+            SUMMARY_JSON=$(jq -c '{
+              passed:   (.stats.expected   // 0),
+              failed:   (.stats.unexpected // 0),
+              skipped:  (.stats.skipped    // 0),
+              duration: (.stats.duration   // 0)
+            }' test-results.json 2>/dev/null || echo '{"passed":0,"failed":0,"skipped":0,"duration":0}')
+          fi
+
+          echo "Summary: $SUMMARY_JSON"
+          echo "Tests count: $(echo "$TESTS_JSON" | jq 'length' 2>/dev/null || echo '?')"
+
+          if [ -n "$QA_API_URL" ]; then
+            jq -n \
+              --arg  story_id    "$STORY" \
+              --arg  project     "$PROJECT" \
+              --arg  status      "$STATUS" \
+              --arg  run_id      "$RUN_ID" \
+              --arg  actor       "$ACTOR" \
+              --arg  repo        "$REPO" \
+              --arg  commit_sha  "$SHA" \
+              --arg  run_url     "https://github.com/$REPO/actions/runs/$RUN_ID" \
+              --arg  s3_prefix   "$S3_PREFIX" \
+              --arg  recording_key    "$RECORDING_KEY" \
+              --arg  recording_sha256 "$RECORDING_SHA256" \
+              --argjson summary  "$SUMMARY_JSON" \
+              --argjson tests    "$TESTS_JSON" \
+              '{
+                story_id:            $story_id,
+                project:             $project,
+                status:              $status,
+                run_id:              $run_id,
+                actor:               $actor,
+                repo:                $repo,
+                commit_sha:          $commit_sha,
+                run_url:             $run_url,
+                s3_artifacts_prefix: $s3_prefix,
+                summary:             $summary,
+                tests:               $tests
+              } + (if $recording_key != "" then {session_recording_key: $recording_key, session_recording_sha256: $recording_sha256} else {} end)' \
+            | curl -sf -X POST "$QA_API_URL/runs/report" \
+                -H "Content-Type: application/json" \
+                --data-binary @- \
+              || echo "[QA Workbench] API post failed (non-fatal)"
+          else
+            echo "[QA Workbench] QA_WORKBENCH_API secret not set — skipping report post"
+          fi

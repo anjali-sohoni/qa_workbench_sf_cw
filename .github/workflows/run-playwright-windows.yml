@@ -1,0 +1,409 @@
+name: Run Playwright Tests (Windows)
+
+# Windows counterpart of run-playwright.yml -- NEW, SEPARATE workflow file.
+# run-playwright.yml (Ubuntu/Xvfb) is left completely unchanged by this file.
+#
+# Triggered by the QA Workbench Lambda after pushing a spec file.
+# Always runs on the default branch (where the workflow file lives).
+# Fetches the exact spec commit via commit_sha input so test files are
+# always found regardless of branch state.
+#
+# Design note: a windows-latest GitHub-hosted runner already boots into a
+# real, full desktop session -- there is no Xvfb/openbox/tint2 fake-desktop
+# stack here (that whole category of complexity, and its failure modes,
+# simply doesn't exist on Windows). See
+# WINDOWS_RUNNER_AND_ORG_MIGRATION_ARCHITECTURE.md Part 1 for the full
+# step-by-step mapping this file implements.
+#
+# NOT YET SMOKE-TESTED. Per the lesson learned from the Ubuntu pipeline's own
+# black-screen saga (HEADED_MODE_AUDIT_RECORDING_ARCHITECTURE.md): a
+# plausible-sounding pipeline design still needs a real run to confirm the
+# desktop/recording is actually captured before this is trusted as the
+# default. Run this once manually (Actions tab -> this workflow -> Run
+# workflow) and inspect recordings/session-recording.mp4 before flipping
+# GITHUB_PW_WORKFLOW to it.
+on:
+  workflow_dispatch:
+    inputs:
+      story_id:
+        description: 'Story ID (e.g. US-0001) — used to label the report'
+        required: false
+        default: ''
+      actor:
+        description: 'Who triggered the run'
+        required: false
+        default: 'ci'
+      commit_sha:
+        description: 'Exact commit SHA containing the spec files (pushed by QA Workbench)'
+        required: false
+        default: ''
+      spec_paths:
+        description: 'Comma-separated spec file paths to run (e.g. tests/cross-app/TC-0001-02.spec.ts)'
+        required: false
+        default: ''
+      project:
+        description: 'Project code (e.g. SF-v1) — used to filter runs in the dashboard'
+        required: false
+        default: ''
+
+permissions:
+  id-token: write   # required for AWS OIDC (configure-aws-credentials)
+  contents: read    # required for actions/checkout
+
+env:
+  # Same audit requirement as the Ubuntu pipeline: OS-level screen recording
+  # (real browser window + native taskbar clock), not just Playwright's own
+  # per-test screenshot/video. On Windows this is a real desktop session, so
+  # recording it is simpler -- no fake display to build first.
+  RECORDING_TZ: "Asia/Kolkata"        # IANA name, kept in sync with the Ubuntu workflow
+  RECORDING_TZ_WINDOWS: "India Standard Time"  # Windows tz id equivalent -- update both if this changes
+
+defaults:
+  run:
+    shell: bash   # GitHub's Windows runners default new steps to pwsh; every step below
+                   # is written as POSIX shell to stay a faithful, easy-to-diff port of
+                   # run-playwright.yml. Git Bash ships preinstalled on windows-latest.
+
+jobs:
+  playwright:
+    name: Playwright Tests (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout default branch (config + workflow lives here)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history to fetch arbitrary commits
+
+      - name: Fetch spec files from the pushed commit
+        run: |
+          SHA="${{ github.event.inputs.commit_sha }}"
+          PATHS="${{ github.event.inputs.spec_paths }}"
+
+          if [ -z "$SHA" ]; then
+            echo "No commit_sha provided — using files already on this branch."
+          else
+            echo "Fetching spec commit $SHA..."
+            git fetch origin "$SHA" 2>/dev/null || git fetch --all
+            if [ -n "$PATHS" ]; then
+              echo "$PATHS" | tr ',' '\n' | while read -r p; do
+                p=$(echo "$p" | xargs)
+                if [ -n "$p" ]; then
+                  mkdir -p "$(dirname "$p")"
+                  git checkout "$SHA" -- "$p" 2>/dev/null && echo "  fetched: $p" || echo "  ⚠ could not fetch: $p"
+                fi
+              done
+            else
+              git checkout "$SHA" -- tests/ 2>/dev/null && echo "  fetched tests/ from $SHA" || echo "  ⚠ could not fetch tests/ from $SHA"
+            fi
+          fi
+
+          echo ""
+          echo "=== Spec files present ==="
+          find . -name "*.spec.ts" -not -path "*/node_modules/*" | sort || echo "(none found)"
+
+      - name: Debug -- print the playwright.config.ts actually live in this checkout
+        run: |
+          echo "=== playwright.config.ts as checked out for this run ==="
+          cat playwright.config.ts || echo "(no playwright.config.ts found at repo root!)"
+          echo "=== CI env var ==="
+          echo "CI=$CI"
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Playwright browsers (Chromium only)
+        run: npx playwright install chromium
+        # No --with-deps here: that flag installs Linux system packages via apt and is a
+        # no-op/unsupported on Windows -- Chromium's Windows build has no such runtime deps.
+
+      # ── Audit recording: real Windows desktop session, native local time ──
+      # No Xvfb/openbox/tint2 equivalent needed -- windows-latest already has a real,
+      # full desktop session for Chromium (headless:false in playwright.config.ts) to
+      # open a window in.
+      - name: Install recording dependencies (ffmpeg via choco)
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Set native local time
+        run: |
+          echo "TZ=${RECORDING_TZ}" >> "$GITHUB_ENV"
+          powershell -NoProfile -Command "Set-TimeZone -Id '${RECORDING_TZ_WINDOWS}'" \
+            || echo "⚠ Set-TimeZone failed -- continuing with runner default timezone (non-fatal)"
+          powershell -NoProfile -Command "Get-TimeZone" || true
+
+      - name: Start OS screen recording
+        run: |
+          mkdir -p recordings recordings/debug
+
+          # gdigrab captures the whole real Windows desktop, mirroring how the Ubuntu
+          # workflow's x11grab captures the whole virtual display :99 (not a specific
+          # window) -- kept for parity between the two pipelines.
+          #
+          # +frag_keyframe+empty_moov+default_base_moof (fragmented MP4) instead of
+          # +faststart: faststart requires ffmpeg to finish cleanly and rewrite the moov
+          # atom at the very end, so if the stop step ever has to force-kill the process
+          # (see below), the file is left with no valid index at all -- unplayable,
+          # 0:00:00 duration, no thumbnail. A fragmented MP4 writes its index
+          # incrementally, so whatever has been captured stays a valid, playable file
+          # even under an abrupt kill.
+          TZ="${RECORDING_TZ}" ffmpeg -y \
+            -f gdigrab -framerate 15 -i desktop \
+            -pix_fmt yuv420p -movflags +frag_keyframe+empty_moov+default_base_moof \
+            recordings/session-recording.mp4 > recordings/debug/ffmpeg.log 2>&1 &
+          echo $! > /tmp/ffmpeg.pid
+          sleep 1
+
+          # Diagnostic loop (Windows equivalent of the Ubuntu pipeline's wmctrl/xwininfo
+          # dump): there is no direct Windows CLI equivalent of those X11 tools
+          # preinstalled on the runner, so this logs the chrome.exe process list instead
+          # as a best-effort "is a browser process actually running" signal. This is
+          # weaker than the Ubuntu diagnostic (it can't confirm a window is on-screen,
+          # only that the process exists) -- flagged as an open item in the design doc;
+          # replace with a proper window-enumeration check if this proves insufficient
+          # once real recordings are reviewed.
+          ( i=0
+            while [ -f /tmp/ffmpeg.pid ]; do
+              i=$((i+1))
+              {
+                echo "=== $(date -Is) ==="
+                tasklist //FI "IMAGENAME eq chrome.exe" 2>&1 || echo "(tasklist failed)"
+              } >> recordings/debug/windows.log
+              sleep 15
+            done
+          ) &
+          echo $! > /tmp/diag.pid
+
+      - name: Validate required secrets
+        run: |
+          MISSING=""
+          [ -z "$SF_COMM_URL" ]           && MISSING="$MISSING SF_COMM_URL"
+          [ -z "$SF_COMM_USERNAME" ]      && MISSING="$MISSING SF_COMM_USERNAME"
+          [ -z "$SF_COMM_EFFECTIVE_PW" ]  && MISSING="$MISSING SF_COMM_EFFECTIVE_PW"
+          [ -z "$SF_SALES_URL" ]          && MISSING="$MISSING SF_SALES_URL"
+          [ -z "$SF_SALES_USERNAME" ]     && MISSING="$MISSING SF_SALES_USERNAME"
+          [ -z "$SF_SALES_EFFECTIVE_PW" ] && MISSING="$MISSING SF_SALES_EFFECTIVE_PW"
+          if [ -n "$MISSING" ]; then
+            echo "❌ Missing required GitHub secrets:$MISSING"
+            echo "Add them at: https://github.com/$GITHUB_REPOSITORY/settings/secrets/actions"
+            exit 1
+          fi
+          echo "✅ All required secrets present"
+          echo "   SF_COMM_URL  = $SF_COMM_URL"
+          echo "   SF_SALES_URL = $SF_SALES_URL"
+        env:
+          SF_COMM_URL:           ${{ secrets.SF_COMM_URL }}
+          SF_COMM_USERNAME:      ${{ secrets.SF_COMM_USERNAME }}
+          SF_COMM_EFFECTIVE_PW:  ${{ secrets.SF_COMM_EFFECTIVE_PW }}
+          SF_SALES_URL:          ${{ secrets.SF_SALES_URL }}
+          SF_SALES_USERNAME:     ${{ secrets.SF_SALES_USERNAME }}
+          SF_SALES_EFFECTIVE_PW: ${{ secrets.SF_SALES_EFFECTIVE_PW }}
+
+      - name: Run Playwright tests
+        id: run_tests
+        env:
+          SF_COMM_URL:           ${{ secrets.SF_COMM_URL }}
+          SF_COMM_USERNAME:      ${{ secrets.SF_COMM_USERNAME }}
+          SF_COMM_EFFECTIVE_PW:  ${{ secrets.SF_COMM_EFFECTIVE_PW }}
+          SF_SALES_URL:          ${{ secrets.SF_SALES_URL }}
+          SF_SALES_USERNAME:     ${{ secrets.SF_SALES_USERNAME }}
+          SF_SALES_EFFECTIVE_PW: ${{ secrets.SF_SALES_EFFECTIVE_PW }}
+          DEBUG: "pw:browser"
+        # Reporters are defined in playwright.config.ts (list + json → test-results.json + html).
+        # Do NOT pass --reporter here — same reason as the Ubuntu workflow.
+        run: npx playwright test
+        continue-on-error: true   # upload report even on test failure
+
+      - name: Stop OS screen recording
+        if: always()
+        run: |
+          FFMPEG_PID_FILE=/tmp/ffmpeg.pid
+          if [ -f "$FFMPEG_PID_FILE" ]; then
+            FFMPEG_PID="$(cat "$FFMPEG_PID_FILE")"
+            rm -f "$FFMPEG_PID_FILE"
+            # IMPORTANT: request a graceful stop FIRST, without /F. A force kill
+            # (taskkill /F) was the actual bug in the first Windows run of this workflow
+            # -- it terminates ffmpeg instantly with no chance to flush/finalize, which
+            # (combined with the old +faststart flag) produced an unplayable
+            # 0:00:00-duration MP4 in the uploaded artifact. Poll briefly for it to exit
+            # on its own; only force-kill as an absolute last resort so the job doesn't
+            # hang if it truly won't stop. ffmpeg.exe is a native Windows process under
+            # Git Bash -- plain POSIX `kill` does not reliably reach it, so taskkill is
+            # used for both the graceful and the forceful attempt.
+            taskkill //PID "$FFMPEG_PID" 2>/dev/null || true
+            for i in $(seq 1 15); do
+              tasklist //FI "PID eq $FFMPEG_PID" 2>/dev/null | grep -q "$FFMPEG_PID" || break
+              sleep 1
+            done
+            taskkill //F //PID "$FFMPEG_PID" 2>/dev/null || true
+          fi
+          [ -f /tmp/diag.pid ] && kill "$(cat /tmp/diag.pid)" 2>/dev/null || true
+          ls -la recordings/ recordings/debug/ 2>/dev/null || true
+
+      - name: Upload Playwright report to GitHub Actions
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-${{ github.event.inputs.story_id || github.run_id }}
+          path: |
+            playwright-report/
+            test-results/
+            recordings/
+          retention-days: 30
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        if: always()
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+        continue-on-error: true   # non-fatal if OIDC not configured
+
+      - name: Upload artifacts to S3
+        if: always()
+        env:
+          ARTIFACTS_BUCKET: ${{ secrets.ARTIFACTS_BUCKET }}
+        run: |
+          STORY="${{ github.event.inputs.story_id }}"
+          RUN_ID="${{ github.run_id }}"
+          S3_PREFIX="runs/${STORY}/${RUN_ID}"
+
+          if [ -z "$ARTIFACTS_BUCKET" ]; then
+            echo "ARTIFACTS_BUCKET secret not set — skipping S3 upload"
+            echo "S3_PREFIX=" >> "$GITHUB_ENV"
+          else
+            echo "Uploading artifacts to s3://${ARTIFACTS_BUCKET}/${S3_PREFIX}/"
+
+            if [ -d test-results ] && [ -n "$(ls -A test-results 2>/dev/null)" ]; then
+              aws s3 cp test-results/ "s3://${ARTIFACTS_BUCKET}/${S3_PREFIX}/test-results/" \
+                --recursive --quiet && echo "  ✅ test-results/ uploaded" \
+                || echo "  ⚠ test-results/ upload failed (non-fatal)"
+
+              # Content-Type fix for the per-test Playwright videos (.webm): the bulk
+              # --recursive copy above lets the AWS CLI guess Content-Type per file from
+              # Python's mimetypes module, which does not map .webm by default on this
+              # Windows runner -- files land in S3 tagged application/octet-stream, which
+              # the QA Workbench dashboard's <video> tag refuses to play inline (shows
+              # 0:00 duration, no thumbnail) even though the file itself is perfectly
+              # valid -- confirmed by the same file playing fine when opened directly
+              # from S3. Re-upload just the .webm files with the correct type explicitly.
+              find test-results -iname "*.webm" 2>/dev/null | while IFS= read -r f; do
+                rel="${f#test-results/}"
+                aws s3 cp "$f" "s3://${ARTIFACTS_BUCKET}/${S3_PREFIX}/test-results/${rel}" \
+                  --content-type video/webm --quiet \
+                  && echo "  ✅ ${rel} re-tagged as video/webm" \
+                  || echo "  ⚠ ${rel} content-type fix failed (non-fatal)"
+              done
+            fi
+
+            if [ -d playwright-report ] && [ -n "$(ls -A playwright-report 2>/dev/null)" ]; then
+              aws s3 cp playwright-report/ "s3://${ARTIFACTS_BUCKET}/${S3_PREFIX}/playwright-report/" \
+                --recursive --quiet && echo "  ✅ playwright-report/ uploaded" \
+                || echo "  ⚠ playwright-report/ upload failed (non-fatal)"
+            fi
+
+            if [ -f recordings/session-recording.mp4 ]; then
+              RECORDING_KEY="${S3_PREFIX}/session-recording.mp4"
+              RECORDING_SHA256=$(sha256sum recordings/session-recording.mp4 | awk '{print $1}')
+              aws s3 cp recordings/session-recording.mp4 "s3://${ARTIFACTS_BUCKET}/${RECORDING_KEY}" --quiet \
+                && echo "  ✅ session-recording.mp4 uploaded (sha256 ${RECORDING_SHA256})" \
+                || echo "  ⚠ session-recording.mp4 upload failed (non-fatal)"
+              echo "RECORDING_KEY=${RECORDING_KEY}" >> "$GITHUB_ENV"
+              echo "RECORDING_SHA256=${RECORDING_SHA256}" >> "$GITHUB_ENV"
+            else
+              echo "  (no session recording found -- continuing without one)"
+            fi
+
+            echo "S3_PREFIX=${S3_PREFIX}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Post results back to QA Workbench API
+        if: always()
+        env:
+          QA_API_URL: ${{ secrets.QA_WORKBENCH_API }}
+        run: |
+          STATUS="${{ steps.run_tests.outcome }}"
+          STORY="${{ github.event.inputs.story_id }}"
+          PROJECT="${{ github.event.inputs.project }}"
+          ACTOR="${{ github.event.inputs.actor }}"
+          RUN_ID="${{ github.run_id }}"
+          REPO="${{ github.repository }}"
+          SHA="${{ github.event.inputs.commit_sha }}"
+          S3_PREFIX="${{ env.S3_PREFIX }}"
+          RECORDING_KEY="${{ env.RECORDING_KEY }}"
+          RECORDING_SHA256="${{ env.RECORDING_SHA256 }}"
+
+          TESTS_JSON="[]"
+          SUMMARY_JSON='{"passed":0,"failed":0,"skipped":0,"duration":0}'
+
+          if [ -f test-results.json ]; then
+            TESTS_JSON=$(jq -c '[
+              .suites[]? as $top |
+              ($top.specs[]?, ($top.suites[]?.specs[]?)) |
+              select(. != null and has("title") and has("tests")) |
+              {
+                title: .title,
+                file: ($top.file // $top.title // ""),
+                ok: (.ok // false),
+                status: (if (.ok // false) then "passed" else "failed" end),
+                duration: ((.tests // []) | first? | (.results // []) | last? | .duration // 0),
+                error:    ((.tests // []) | first? | (.results // []) | last? | .errors[0]?.message // null),
+                attachments: [
+                  ((.tests // []) | first? | (.results // []) | last? | .attachments // [])[] |
+                  select(.path != null and .path != "") |
+                  { name: .name, contentType: (.contentType // ""), rel: (.path | gsub("\\\\"; "/") | split("test-results/") | last) }
+                ]
+              }
+            ]' test-results.json 2>/dev/null || echo "[]")
+
+            SUMMARY_JSON=$(jq -c '{
+              passed:   (.stats.expected   // 0),
+              failed:   (.stats.unexpected // 0),
+              skipped:  (.stats.skipped    // 0),
+              duration: (.stats.duration   // 0)
+            }' test-results.json 2>/dev/null || echo '{"passed":0,"failed":0,"skipped":0,"duration":0}')
+          fi
+
+          echo "Summary: $SUMMARY_JSON"
+          echo "Tests count: $(echo "$TESTS_JSON" | jq 'length' 2>/dev/null || echo '?')"
+
+          if [ -n "$QA_API_URL" ]; then
+            jq -n \
+              --arg  story_id    "$STORY" \
+              --arg  project     "$PROJECT" \
+              --arg  status      "$STATUS" \
+              --arg  run_id      "$RUN_ID" \
+              --arg  actor       "$ACTOR" \
+              --arg  repo        "$REPO" \
+              --arg  commit_sha  "$SHA" \
+              --arg  run_url     "https://github.com/$REPO/actions/runs/$RUN_ID" \
+              --arg  s3_prefix   "$S3_PREFIX" \
+              --arg  recording_key    "$RECORDING_KEY" \
+              --arg  recording_sha256 "$RECORDING_SHA256" \
+              --argjson summary  "$SUMMARY_JSON" \
+              --argjson tests    "$TESTS_JSON" \
+              '{
+                story_id:            $story_id,
+                project:             $project,
+                status:              $status,
+                run_id:              $run_id,
+                actor:               $actor,
+                repo:                $repo,
+                commit_sha:          $commit_sha,
+                run_url:             $run_url,
+                s3_artifacts_prefix: $s3_prefix,
+                summary:             $summary,
+                tests:               $tests
+              } + (if $recording_key != "" then {session_recording_key: $recording_key, session_recording_sha256: $recording_sha256} else {} end)' \
+            | curl -sf -X POST "$QA_API_URL/runs/report" \
+                -H "Content-Type: application/json" \
+                --data-binary @- \
+              || echo "[QA Workbench] API post failed (non-fatal)"
+          else
+            echo "[QA Workbench] QA_WORKBENCH_API secret not set — skipping report post"
+          fi
